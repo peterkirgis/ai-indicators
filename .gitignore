@@ -1,0 +1,19 @@
+# Secrets
+.env
+
+# Generated data (too large for git)
+data/
+
+# Scratch / exploration files
+scratch/
+
+# Python
+__pycache__/
+*.pyc
+.mypy_cache/
+
+# OS
+.DS_Store
+
+# IDE
+.claude/

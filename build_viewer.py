@@ -1,0 +1,410 @@
+"""
+Build an HTML viewer for browsing comments by article and reviewing sentiment results.
+
+Outputs to docs/ for GitHub Pages:
+  docs/index.html  — the viewer app (lightweight)
+  docs/data.json   — article + comment + sentiment data (loaded async)
+
+Usage:
+    python build_viewer.py
+    open docs/index.html
+"""
+
+import json
+import os
+from pathlib import Path
+
+COMMENTS_PATH = "data/comments.json"
+SENTIMENT_PATH = "data/sentiment.json"
+DOCS_DIR = Path("docs")
+
+
+def load_data():
+    """Load comments and merge in any available sentiment data."""
+    articles = json.loads(open(COMMENTS_PATH).read())
+
+    sentiment_map = {}
+    if os.path.exists(SENTIMENT_PATH):
+        sentiment_articles = json.loads(open(SENTIMENT_PATH).read())
+        for a in sentiment_articles:
+            for c in a["comments"]:
+                if "sentiment" in c:
+                    sentiment_map[c["commentID"]] = {
+                        "sentiment": c["sentiment"],
+                        "framing": c.get("framing", ""),
+                        "confidence": c.get("confidence", ""),
+                    }
+
+    for a in articles:
+        for c in a["comments"]:
+            if c["commentID"] in sentiment_map:
+                c["sentiment"] = sentiment_map[c["commentID"]]["sentiment"]
+                c["framing"] = sentiment_map[c["commentID"]]["framing"]
+                c["confidence"] = sentiment_map[c["commentID"]]["confidence"]
+
+    return articles, len(sentiment_map)
+
+
+def build_data_json(articles):
+    """Build the slim data payload for the viewer."""
+    return [{
+        "article_id": a["article_id"],
+        "web_url": a["web_url"],
+        "headline": a["headline"],
+        "pub_date": a["pub_date"],
+        "month": a["month"],
+        "comment_count": a["comment_count"],
+        "comments": [{
+            "commentID": c["commentID"],
+            "commentBody": c["commentBody"],
+            "userDisplayName": c.get("userDisplayName", ""),
+            "userLocation": c.get("userLocation", ""),
+            "createDate": c.get("createDate", ""),
+            "recommendations": c.get("recommendations", 0),
+            "depth": c.get("depth", 1),
+            "sentiment": c.get("sentiment", ""),
+            "framing": c.get("framing", ""),
+            "confidence": c.get("confidence", ""),
+        } for c in a["comments"]]
+    } for a in articles]
+
+
+INDEX_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>NYT AI Comments Viewer</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #f5f5f5; color: #222; }
+
+  .loading { display: flex; align-items: center; justify-content: center; height: 100vh;
+             font-size: 18px; color: #999; }
+  .layout { display: flex; height: 100vh; }
+
+  /* --- Sidebar --- */
+  .sidebar { width: 380px; min-width: 380px; background: #fff; border-right: 1px solid #ddd;
+              display: flex; flex-direction: column; }
+  .sidebar-header { padding: 16px; border-bottom: 1px solid #eee; background: #fafafa; }
+  .sidebar-header h1 { font-size: 16px; margin-bottom: 8px; }
+  .sidebar-header .stats { font-size: 13px; color: #666; line-height: 1.6; }
+  .search-box { width: 100%; padding: 8px 12px; border: 1px solid #ddd; border-radius: 6px;
+                 font-size: 14px; margin-top: 8px; }
+  .filter-row { display: flex; gap: 6px; margin-top: 8px; flex-wrap: wrap; }
+  .filter-btn { padding: 4px 10px; border: 1px solid #ddd; border-radius: 12px; font-size: 12px;
+                 cursor: pointer; background: #fff; }
+  .filter-btn.active { background: #333; color: #fff; border-color: #333; }
+  .article-list { flex: 1; overflow-y: auto; }
+  .article-item { padding: 12px 16px; border-bottom: 1px solid #f0f0f0; cursor: pointer;
+                   transition: background 0.1s; }
+  .article-item:hover { background: #f0f7ff; }
+  .article-item.selected { background: #e3f0ff; border-left: 3px solid #2196F3; }
+  .article-item .month { font-size: 11px; color: #999; text-transform: uppercase; }
+  .article-item .headline { font-size: 13px; font-weight: 500; margin: 4px 0; line-height: 1.4; }
+  .article-item .meta { font-size: 11px; color: #888; }
+  .comment-count { background: #eee; padding: 1px 6px; border-radius: 8px; font-size: 11px; }
+
+  /* --- Main panel --- */
+  .main { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
+  .main-header { padding: 16px 24px; border-bottom: 1px solid #eee; background: #fff; }
+  .main-header h2 { font-size: 18px; line-height: 1.4; }
+  .main-header .article-meta { font-size: 13px; color: #666; margin-top: 4px; }
+  .main-header a { color: #2196F3; text-decoration: none; }
+  .comments-container { flex: 1; overflow-y: auto; padding: 16px 24px; }
+
+  .comment { background: #fff; border-radius: 8px; padding: 16px; margin-bottom: 12px;
+              border: 1px solid #e8e8e8; }
+  .comment.depth-2 { margin-left: 32px; border-left: 3px solid #ddd; }
+  .comment-header { display: flex; justify-content: space-between; align-items: center;
+                     margin-bottom: 8px; }
+  .comment-author { font-weight: 600; font-size: 13px; }
+  .comment-location { color: #888; font-size: 12px; }
+  .comment-body { font-size: 14px; line-height: 1.6; color: #333; }
+  .comment-footer { display: flex; gap: 16px; margin-top: 10px; font-size: 12px; color: #999; }
+
+  /* Sentiment badges */
+  .sentiment-badge { display: inline-block; padding: 2px 8px; border-radius: 10px;
+                      font-size: 11px; font-weight: 600; text-transform: uppercase; }
+  .sentiment-positive { background: #e8f5e9; color: #2e7d32; }
+  .sentiment-negative { background: #fce4ec; color: #c62828; }
+  .sentiment-neutral { background: #f5f5f5; color: #757575; }
+  .sentiment-irrelevant { background: #fff3e0; color: #e65100; }
+  .framing-badge { display: inline-block; padding: 2px 8px; border-radius: 10px;
+                    font-size: 11px; font-weight: 600; text-transform: uppercase; margin-left: 4px; }
+  .framing-tool { background: #e3f2fd; color: #1565c0; }
+  .framing-entity { background: #f3e5f5; color: #7b1fa2; }
+
+  /* --- Sentiment panel --- */
+  .sentiment-panel { width: 300px; min-width: 300px; background: #fff; border-left: 1px solid #ddd;
+                      padding: 16px; overflow-y: auto; }
+  .sentiment-panel h3 { font-size: 14px; margin-bottom: 12px; }
+  .stat-card { background: #fafafa; border-radius: 8px; padding: 12px; margin-bottom: 10px;
+                border: 1px solid #eee; }
+  .stat-card .label { font-size: 12px; color: #888; text-transform: uppercase; }
+  .stat-card .value { font-size: 24px; font-weight: 700; margin: 4px 0; }
+  .stat-card .sub { font-size: 12px; color: #aaa; }
+  .bar { height: 8px; border-radius: 4px; background: #eee; margin: 8px 0; overflow: hidden;
+          display: flex; }
+  .bar-pos { background: #4caf50; }
+  .bar-neu { background: #bdbdbd; }
+  .bar-neg { background: #e53935; }
+  .bar-irr { background: #ff9800; }
+  .placeholder { color: #bbb; font-size: 13px; text-align: center; padding: 40px 0; }
+
+  .no-article { display: flex; align-items: center; justify-content: center; flex: 1;
+                 color: #bbb; font-size: 16px; }
+</style>
+</head>
+<body>
+<div class="loading" id="loading">Loading data&hellip;</div>
+<div class="layout" id="app" style="display:none">
+
+  <!-- Sidebar: article list -->
+  <div class="sidebar">
+    <div class="sidebar-header">
+      <h1>NYT AI Comments</h1>
+      <div class="stats" id="headerStats"></div>
+      <input type="text" class="search-box" placeholder="Search headlines..." oninput="filterArticles()">
+      <div class="filter-row">
+        <button class="filter-btn active" onclick="setFilter('all')">All</button>
+        <button class="filter-btn" onclick="setFilter('has-comments')">Has comments</button>
+        <button class="filter-btn" onclick="setFilter('classified')">Classified</button>
+      </div>
+    </div>
+    <div class="article-list" id="articleList"></div>
+  </div>
+
+  <!-- Main: comments view -->
+  <div class="main">
+    <div class="main-header" id="mainHeader">
+      <div class="no-article">Select an article from the sidebar</div>
+    </div>
+    <div class="comments-container" id="commentsContainer"></div>
+  </div>
+
+  <!-- Right panel: sentiment stats -->
+  <div class="sentiment-panel" id="sentimentPanel">
+    <h3>Sentiment Analysis</h3>
+    <div id="globalStats"></div>
+    <hr style="border:none;border-top:1px solid #eee;margin:16px 0;">
+    <h3>Article Sentiment</h3>
+    <div id="articleStats"><div class="placeholder">Select an article to see its sentiment breakdown</div></div>
+  </div>
+
+</div>
+
+<script>
+let articles = [];
+let currentFilter = 'all';
+let selectedIdx = -1;
+
+fetch('data.json')
+  .then(r => r.json())
+  .then(data => {
+    articles = data;
+    document.getElementById('loading').style.display = 'none';
+    document.getElementById('app').style.display = 'flex';
+
+    const totalComments = articles.reduce((s, a) => s + a.comment_count, 0);
+    const classified = articles.flatMap(a => a.comments).filter(c => c.sentiment).length;
+    document.getElementById('headerStats').innerHTML =
+      `${articles.length} articles &middot; ${totalComments.toLocaleString()} comments &middot; ${classified.toLocaleString()} classified`;
+
+    renderGlobalStats();
+    filterArticles();
+  })
+  .catch(err => {
+    document.getElementById('loading').textContent = 'Error loading data: ' + err.message;
+  });
+
+function setFilter(f) {
+  currentFilter = f;
+  document.querySelectorAll('.filter-btn').forEach(b => b.classList.remove('active'));
+  event.target.classList.add('active');
+  filterArticles();
+}
+
+function filterArticles() {
+  const q = document.querySelector('.search-box').value.toLowerCase();
+  const list = document.getElementById('articleList');
+  list.innerHTML = '';
+  articles.forEach((a, i) => {
+    if (q && !a.headline.toLowerCase().includes(q)) return;
+    if (currentFilter === 'has-comments' && a.comment_count === 0) return;
+    if (currentFilter === 'classified' && !a.comments.some(c => c.sentiment)) return;
+    const div = document.createElement('div');
+    div.className = 'article-item' + (i === selectedIdx ? ' selected' : '');
+    const hasClassified = a.comments.some(c => c.sentiment);
+    div.innerHTML = `
+      <div class="month">${a.month}</div>
+      <div class="headline">${escHtml(a.headline)}</div>
+      <div class="meta">
+        <span class="comment-count">${a.comment_count} comments</span>
+        ${hasClassified ? '<span class="sentiment-badge sentiment-positive" style="margin-left:4px">classified</span>' : ''}
+      </div>`;
+    div.onclick = () => selectArticle(i);
+    list.appendChild(div);
+  });
+}
+
+function selectArticle(idx) {
+  selectedIdx = idx;
+  const a = articles[idx];
+
+  const header = document.getElementById('mainHeader');
+  header.innerHTML = `
+    <h2>${escHtml(a.headline)}</h2>
+    <div class="article-meta">
+      ${a.month} &middot; ${a.comment_count} comments &middot;
+      <a href="${a.web_url}" target="_blank">Read on NYT</a>
+    </div>`;
+
+  const container = document.getElementById('commentsContainer');
+  container.innerHTML = '';
+  container.scrollTop = 0;
+  a.comments.forEach(c => {
+    const div = document.createElement('div');
+    div.className = 'comment' + (c.depth > 1 ? ' depth-2' : '');
+    const sentBadge = c.sentiment
+      ? `<span class="sentiment-badge sentiment-${c.sentiment}">${c.sentiment}</span>`
+      : '';
+    const frameBadge = c.framing && c.framing !== 'neither'
+      ? `<span class="framing-badge framing-${c.framing}">${c.framing}</span>`
+      : '';
+    const date = c.createDate ? new Date(parseInt(c.createDate) * 1000).toLocaleDateString() : '';
+    div.innerHTML = `
+      <div class="comment-header">
+        <div>
+          <span class="comment-author">${escHtml(c.userDisplayName)}</span>
+          <span class="comment-location">${c.userLocation ? ' · ' + escHtml(c.userLocation) : ''}</span>
+        </div>
+        <div>${sentBadge} ${frameBadge}</div>
+      </div>
+      <div class="comment-body">${escHtml(c.commentBody)}</div>
+      <div class="comment-footer">
+        <span>&#9829; ${c.recommendations}</span>
+        <span>${date}</span>
+      </div>`;
+    container.appendChild(div);
+  });
+
+  // Article sentiment stats
+  const statsDiv = document.getElementById('articleStats');
+  const classified = a.comments.filter(c => c.sentiment);
+  if (classified.length === 0) {
+    statsDiv.innerHTML = '<div class="placeholder">No comments classified yet</div>';
+  } else {
+    const pos = classified.filter(c => c.sentiment === 'positive').length;
+    const neg = classified.filter(c => c.sentiment === 'negative').length;
+    const neu = classified.filter(c => c.sentiment === 'neutral').length;
+    const irr = classified.filter(c => c.sentiment === 'irrelevant').length;
+    const total = classified.length;
+    statsDiv.innerHTML = `
+      <div class="stat-card">
+        <div class="label">Classified</div>
+        <div class="value">${total} / ${a.comment_count}</div>
+      </div>
+      <div class="bar">
+        <div class="bar-pos" style="width:${pos/total*100}%"></div>
+        <div class="bar-neu" style="width:${neu/total*100}%"></div>
+        <div class="bar-neg" style="width:${neg/total*100}%"></div>
+        <div class="bar-irr" style="width:${irr/total*100}%"></div>
+      </div>
+      <div class="stat-card">
+        <div class="label">Positive</div>
+        <div class="value" style="color:#2e7d32">${pos} <span class="sub">(${(pos/total*100).toFixed(1)}%)</span></div>
+      </div>
+      <div class="stat-card">
+        <div class="label">Neutral</div>
+        <div class="value" style="color:#757575">${neu} <span class="sub">(${(neu/total*100).toFixed(1)}%)</span></div>
+      </div>
+      <div class="stat-card">
+        <div class="label">Negative</div>
+        <div class="value" style="color:#c62828">${neg} <span class="sub">(${(neg/total*100).toFixed(1)}%)</span></div>
+      </div>
+      <div class="stat-card">
+        <div class="label">Irrelevant</div>
+        <div class="value" style="color:#e65100">${irr} <span class="sub">(${(irr/total*100).toFixed(1)}%)</span></div>
+      </div>`;
+  }
+
+  filterArticles();
+}
+
+function escHtml(s) {
+  const d = document.createElement('div');
+  d.textContent = s;
+  return d.innerHTML;
+}
+
+function renderGlobalStats() {
+  const all = articles.flatMap(a => a.comments).filter(c => c.sentiment);
+  const div = document.getElementById('globalStats');
+  if (all.length === 0) {
+    div.innerHTML = '<div class="placeholder">No comments classified yet.<br>Run step3_sentiment.py to start.</div>';
+    return;
+  }
+  const pos = all.filter(c => c.sentiment === 'positive').length;
+  const neg = all.filter(c => c.sentiment === 'negative').length;
+  const neu = all.filter(c => c.sentiment === 'neutral').length;
+  const irr = all.filter(c => c.sentiment === 'irrelevant').length;
+  const total = all.length;
+  const totalAll = articles.reduce((s, a) => s + a.comment_count, 0);
+  div.innerHTML = `
+    <div class="stat-card">
+      <div class="label">Overall Progress</div>
+      <div class="value">${total.toLocaleString()} <span class="sub">/ ${totalAll.toLocaleString()}</span></div>
+      <div class="sub">${(total/totalAll*100).toFixed(1)}% complete</div>
+    </div>
+    <div class="bar">
+      <div class="bar-pos" style="width:${pos/total*100}%"></div>
+      <div class="bar-neu" style="width:${neu/total*100}%"></div>
+      <div class="bar-neg" style="width:${neg/total*100}%"></div>
+      <div class="bar-irr" style="width:${irr/total*100}%"></div>
+    </div>
+    <div class="stat-card">
+      <div class="label">Positive</div>
+      <div class="value" style="color:#2e7d32">${pos} <span class="sub">(${(pos/total*100).toFixed(1)}%)</span></div>
+    </div>
+    <div class="stat-card">
+      <div class="label">Neutral</div>
+      <div class="value" style="color:#757575">${neu} <span class="sub">(${(neu/total*100).toFixed(1)}%)</span></div>
+    </div>
+    <div class="stat-card">
+      <div class="label">Negative</div>
+      <div class="value" style="color:#c62828">${neg} <span class="sub">(${(neg/total*100).toFixed(1)}%)</span></div>
+    </div>
+    <div class="stat-card">
+      <div class="label">Irrelevant</div>
+      <div class="value" style="color:#e65100">${irr} <span class="sub">(${(irr/total*100).toFixed(1)}%)</span></div>
+    </div>`;
+}
+</script>
+</body>
+</html>"""
+
+
+def main():
+    DOCS_DIR.mkdir(parents=True, exist_ok=True)
+
+    articles, num_classified = load_data()
+    data = build_data_json(articles)
+
+    # Write data.json
+    data_path = DOCS_DIR / "data.json"
+    with open(data_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False)
+
+    # Write index.html
+    html_path = DOCS_DIR / "index.html"
+    with open(html_path, "w", encoding="utf-8") as f:
+        f.write(INDEX_HTML)
+
+    data_mb = data_path.stat().st_size / (1024 * 1024)
+    print(f"Built docs/index.html + docs/data.json ({data_mb:.1f} MB)")
+    print(f"  {len(articles)} articles, {num_classified} classified comments")
+
+
+if __name__ == "__main__":
+    main()
