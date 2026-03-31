@@ -9,6 +9,8 @@ import argparse
 import json
 import time
 import sys
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 from tqdm.auto import tqdm
@@ -20,6 +22,7 @@ from config import (
     OPENROUTER_API_KEY,
     SENTIMENT_BATCH_SIZE,
     SENTIMENT_CHECKPOINT_PATH,
+    SENTIMENT_CONCURRENCY,
     SENTIMENT_MODEL,
     SENTIMENT_PATH,
 )
@@ -47,17 +50,19 @@ Classify the commenter's attitude toward AI itself, not their opinion of the art
 """
 
 
-def load_checkpoint() -> set:
+def load_checkpoint() -> tuple[set, dict]:
     if SENTIMENT_CHECKPOINT_PATH.exists():
         data = json.loads(SENTIMENT_CHECKPOINT_PATH.read_text())
-        return set(data.get("completed_comment_ids", []))
-    return set()
+        sentiment_map = {int(k): v for k, v in data.get("results", {}).items()}
+        completed = set(sentiment_map.keys())
+        return completed, sentiment_map
+    return set(), {}
 
 
-def save_checkpoint(completed: set):
+def save_checkpoint(completed: set, sentiment_map: dict):
     SENTIMENT_CHECKPOINT_PATH.write_text(json.dumps({
-        "completed_comment_ids": list(completed),
         "count": len(completed),
+        "results": {str(k): v for k, v in sentiment_map.items()},
     }))
 
 
@@ -85,7 +90,7 @@ def classify_batch(comments: list[dict], headline: str) -> list[dict]:
         json={
             "model": SENTIMENT_MODEL,
             "messages": [
-                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "system", "content": SYSTEM_PROMPT, "cache_control": {"type": "ephemeral"}},
                 {"role": "user", "content": user_prompt},
             ],
             "temperature": 0.0,
@@ -97,6 +102,8 @@ def classify_batch(comments: list[dict], headline: str) -> list[dict]:
 
     content = response.json()["choices"][0]["message"]["content"]
     parsed = json.loads(content)
+    if isinstance(parsed, list):
+        return parsed
     return parsed.get("results", [])
 
 
@@ -139,7 +146,7 @@ def main():
     DATA_DIR.mkdir(parents=True, exist_ok=True)
 
     articles = json.loads(COMMENTS_PATH.read_text())
-    completed = load_checkpoint()
+    completed, sentiment_map = load_checkpoint()
 
     # Build flat list of (comment, headline) pairs needing classification
     work = []
@@ -174,47 +181,44 @@ def main():
             print(f"  [{c['commentID']}] ({headline[:50]}...) {body}...")
         return
 
-    # Build a lookup: commentID -> sentiment result
-    sentiment_map = {}
-
     batches = list(chunk(work, SENTIMENT_BATCH_SIZE))
     backoff_delays = [5, 10, 30, 60]
+    lock = threading.Lock()
 
-    for batch in tqdm(batches, desc="Classifying sentiment"):
+    def process_batch(batch):
         comments_in_batch = [c for c, _ in batch]
-        headline = batch[0][1]  # use first comment's article headline
-
+        headline = batch[0][1]
         for attempt in range(len(backoff_delays) + 1):
             try:
-                results = classify_batch(comments_in_batch, headline)
-                break
-            except KeyboardInterrupt:
-                print("\n\nInterrupted! Progress has been saved.")
-                save_checkpoint(completed)
-                sys.exit(0)
+                return classify_batch(comments_in_batch, headline)
             except Exception as e:
                 if attempt < len(backoff_delays):
-                    delay = backoff_delays[attempt]
-                    print(f"\n  Error: {e}")
-                    print(f"  Retrying in {delay}s...")
-                    time.sleep(delay)
+                    tqdm.write(f"  Attempt {attempt + 1} failed: {e}")
+                    time.sleep(backoff_delays[attempt])
                 else:
-                    print(f"\n  Failed after all retries — skipping batch")
-                    results = []
+                    tqdm.write(f"  Failed after all retries — skipping batch. Last error: {e}")
+                    return []
 
-        # Map results back by comment ID
-        for r in results:
-            cid = r.get("id")
-            if cid is not None:
-                sentiment_map[cid] = {
-                    "sentiment": r.get("sentiment", "neutral"),
-                    "framing": r.get("framing", "neither"),
-                    "confidence": r.get("confidence", "low"),
-                }
-                completed.add(cid)
-
-        save_checkpoint(completed)
-        time.sleep(0.5)  # gentle rate limit
+    with ThreadPoolExecutor(max_workers=SENTIMENT_CONCURRENCY) as executor:
+        futures = {executor.submit(process_batch, batch): batch for batch in batches}
+        try:
+            for future in tqdm(as_completed(futures), total=len(batches), desc="Classifying sentiment"):
+                results = future.result()
+                with lock:
+                    for r in results:
+                        cid = r.get("id")
+                        if cid is not None:
+                            sentiment_map[cid] = {
+                                "sentiment": r.get("sentiment", "neutral"),
+                                "framing": r.get("framing", "neither"),
+                                "confidence": r.get("confidence", "low"),
+                            }
+                            completed.add(cid)
+                    save_checkpoint(completed, sentiment_map)
+        except KeyboardInterrupt:
+            print("\n\nInterrupted! Progress has been saved.")
+            save_checkpoint(completed, sentiment_map)
+            sys.exit(0)
 
     # Print readable sample for review
     print_sample_results(articles, sentiment_map, limit=min(len(work), 50))

@@ -33,7 +33,8 @@ COMMENT_DELAY_S = 1.0  # seconds between articles
 COMMENT_SORT = "recommended"
 
 # ── Sentiment classification ──────────────────────────────────────────
-SENTIMENT_BATCH_SIZE = 20
+SENTIMENT_BATCH_SIZE = 50
+SENTIMENT_CONCURRENCY = 10   # parallel API requests
 SENTIMENT_MODEL = "google/gemini-3-flash-preview"
 COMMENT_BODY_MAX_CHARS = 500  # truncate for sentiment prompt
 
