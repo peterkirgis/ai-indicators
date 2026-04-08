@@ -11,10 +11,25 @@ Usage:
 """
 
 import json
+import math
 import os
 import random
 from collections import defaultdict
 from pathlib import Path
+
+WEIGHT_ALPHA = 2.0  # position bias correction: 1.0 = no correction, higher = more aggressive
+MIN_COMMENTS_FOR_BAND = 5  # articles need this many classified comments to contribute to error bands
+
+
+def _percentile(values, p):
+    """Compute p-th percentile without numpy."""
+    if not values:
+        return 0
+    s = sorted(values)
+    k = (len(s) - 1) * p / 100
+    f = int(k)
+    c = min(f + 1, len(s) - 1)
+    return round(s[f] + (k - f) * (s[c] - s[f]), 1)
 
 COMMENTS_PATH = "data/comments.json"
 SENTIMENT_PATH = "data/sentiment.json"
@@ -77,18 +92,48 @@ def build_insights_data(articles):
     monthly_f = defaultdict(lambda: defaultdict(int))
     sbf = defaultdict(lambda: defaultdict(int))  # sentiment by framing
     examples = defaultdict(list)
+    # Per-article percentages for error bands
+    article_pcts = defaultdict(list)  # month -> list of per-article dicts
+    # Per-article sentiment-by-framing for the cross-tab chart
+    sbf_article_pcts = defaultdict(lambda: defaultdict(list))  # framing -> sentiment -> list of %
 
     for article in articles:
         month = article["month"]
         headline = article["headline"]
-        for comment in article["comments"]:
-            s = comment.get("sentiment", "")
+        classified = [c for c in article["comments"] if c.get("sentiment")]
+
+        # Track per-article stats for variance bands
+        if len(classified) >= MIN_COMMENTS_FOR_BAND:
+            n = len(classified)
+            framed = [c for c in classified if c.get("framing") in ("tool", "entity")]
+            nf = len(framed) if framed else 0
+            ap_entry = {
+                "neg": sum(1 for c in classified if c["sentiment"] == "negative") / n * 100,
+                "pos": sum(1 for c in classified if c["sentiment"] == "positive") / n * 100,
+                "neu": sum(1 for c in classified if c["sentiment"] == "neutral") / n * 100,
+            }
+            if nf >= 3:
+                ap_entry["tool"] = sum(1 for c in framed if c["framing"] == "tool") / nf * 100
+                ap_entry["entity"] = sum(1 for c in framed if c["framing"] == "entity") / nf * 100
+            article_pcts[month].append(ap_entry)
+
+        # Per-article sentiment-by-framing for cross-tab error bars
+        for framing_type in ("tool", "entity"):
+            framed_of_type = [c for c in classified if c.get("framing") == framing_type]
+            if len(framed_of_type) >= 3:
+                nft = len(framed_of_type)
+                sbf_article_pcts[framing_type]["negative"].append(
+                    sum(1 for c in framed_of_type if c["sentiment"] == "negative") / nft * 100)
+                sbf_article_pcts[framing_type]["positive"].append(
+                    sum(1 for c in framed_of_type if c["sentiment"] == "positive") / nft * 100)
+                sbf_article_pcts[framing_type]["neutral"].append(
+                    sum(1 for c in framed_of_type if c["sentiment"] == "neutral") / nft * 100)
+
+        for comment in classified:
+            s = comment["sentiment"]
             f = comment.get("framing", "")
             conf = comment.get("confidence", "")
             body = (comment.get("commentBody") or "").strip()
-
-            if not s:
-                continue
 
             monthly_s[month][s] += 1
 
@@ -123,6 +168,7 @@ def build_insights_data(articles):
             continue
         fd = monthly_f[month]
         ft = sum(fd.values())
+        ap = article_pcts.get(month, [])
         monthly.append({
             "month": month,
             "pct_neg": round(sd.get("negative", 0) / total * 100, 1),
@@ -131,6 +177,15 @@ def build_insights_data(articles):
             "total": total,
             "pct_tool": round(fd.get("tool", 0) / ft * 100, 1) if ft else 0,
             "pct_entity": round(fd.get("entity", 0) / ft * 100, 1) if ft else 0,
+            "neg_p25": _percentile([a["neg"] for a in ap], 25) if ap else None,
+            "neg_p75": _percentile([a["neg"] for a in ap], 75) if ap else None,
+            "pos_p25": _percentile([a["pos"] for a in ap], 25) if ap else None,
+            "pos_p75": _percentile([a["pos"] for a in ap], 75) if ap else None,
+            "tool_p25": _percentile([a["tool"] for a in ap if "tool" in a], 25) if any("tool" in a for a in ap) else None,
+            "tool_p75": _percentile([a["tool"] for a in ap if "tool" in a], 75) if any("tool" in a for a in ap) else None,
+            "entity_p25": _percentile([a["entity"] for a in ap if "entity" in a], 25) if any("entity" in a for a in ap) else None,
+            "entity_p75": _percentile([a["entity"] for a in ap if "entity" in a], 75) if any("entity" in a for a in ap) else None,
+            "n_articles": len(ap),
         })
 
     all_s = defaultdict(int)
@@ -156,12 +211,190 @@ def build_insights_data(articles):
         ft = sum(d.values())
         sbf_pct[framing] = {s: round(v / ft * 100, 1) for s, v in d.items()}
 
+    # Compute IQR for sentiment-by-framing cross-tab
+    sbf_bands = {}
+    for framing, sents in sbf_article_pcts.items():
+        sbf_bands[framing] = {}
+        for sent, vals in sents.items():
+            sbf_bands[framing][sent] = {
+                "p25": _percentile(vals, 25),
+                "p75": _percentile(vals, 75),
+            }
+
     return {
         "monthly": monthly,
         "overall": {k: round(v / total_all * 100, 1) for k, v in all_s.items()},
         "framing_overall": {k: round(v / ft_all * 100, 1) for k, v in all_f.items()} if ft_all else {},
         "sbf": sbf_pct,
+        "sbf_bands": sbf_bands,
         "total": total_all,
+        "examples": sampled,
+    }
+
+
+def build_insights_data_weighted(articles, alpha=WEIGHT_ALPHA):
+    """Like build_insights_data, but weights by community endorsement (likes)
+    with position-bias correction. Only includes top-level comments (depth=1)."""
+    monthly_s = defaultdict(lambda: defaultdict(float))
+    monthly_f = defaultdict(lambda: defaultdict(float))
+    sbf = defaultdict(lambda: defaultdict(float))
+    examples = defaultdict(list)
+    article_pcts = defaultdict(list)
+    sbf_article_pcts = defaultdict(lambda: defaultdict(list))
+    total_unweighted = 0
+
+    for article in articles:
+        month = article["month"]
+        headline = article["headline"]
+
+        # Filter to top-level, classified comments and sort by time
+        top_level = [
+            c for c in article["comments"]
+            if c.get("depth", 1) == 1 and c.get("sentiment")
+        ]
+        top_level.sort(key=lambda c: int(c.get("createDate") or 0))
+        n = len(top_level)
+        if n == 0:
+            continue
+
+        # Per-article weighted percentages for error bands
+        art_weights = defaultdict(float)
+        art_framing_w = defaultdict(float)
+        art_sbf_w = defaultdict(lambda: defaultdict(float))  # framing -> sentiment -> weight
+        art_sbf_total = defaultdict(float)  # framing -> total weight
+        art_total_w = 0.0
+        art_framing_total_w = 0.0
+
+        for i, comment in enumerate(top_level):
+            recs = comment.get("recommendations", 0)
+            frac_rank = i / (n - 1) if n > 1 else 0.0
+            rank_factor = 1 + alpha * frac_rank
+            weight = math.log1p(recs) / rank_factor
+            if weight == 0:
+                continue
+
+            total_unweighted += 1
+            s = comment["sentiment"]
+            f = comment.get("framing", "")
+            body = (comment.get("commentBody") or "").strip()
+
+            monthly_s[month][s] += weight
+            art_weights[s] += weight
+            art_total_w += weight
+
+            if f in ("tool", "entity"):
+                monthly_f[month][f] += weight
+                sbf[f][s] += weight
+                art_framing_w[f] += weight
+                art_framing_total_w += weight
+                art_sbf_w[f][s] += weight
+                art_sbf_total[f] += weight
+
+            # Collect examples sorted by weight
+            if comment.get("confidence") == "high" and 80 <= len(body) <= 380:
+                entry = {
+                    "body": body,
+                    "author": comment.get("userDisplayName", "Anonymous"),
+                    "location": comment.get("userLocation", ""),
+                    "recs": recs,
+                    "headline": headline,
+                    "weight": round(weight, 2),
+                }
+                if s == "negative" and f != "entity":
+                    examples["negative"].append(entry)
+                if s == "positive":
+                    examples["positive"].append(entry)
+                if f == "entity" and s == "negative":
+                    examples["entity_negative"].append(entry)
+                if f == "tool":
+                    examples["tool"].append(entry)
+
+        if art_total_w > 0 and n >= MIN_COMMENTS_FOR_BAND:
+            ap_entry = {
+                "neg": art_weights.get("negative", 0) / art_total_w * 100,
+                "pos": art_weights.get("positive", 0) / art_total_w * 100,
+                "neu": art_weights.get("neutral", 0) / art_total_w * 100,
+            }
+            if art_framing_total_w > 0:
+                ap_entry["tool"] = art_framing_w.get("tool", 0) / art_framing_total_w * 100
+                ap_entry["entity"] = art_framing_w.get("entity", 0) / art_framing_total_w * 100
+            article_pcts[month].append(ap_entry)
+
+            # Per-article sentiment-by-framing for cross-tab error bars
+            for ft_type in ("tool", "entity"):
+                if art_sbf_total[ft_type] > 0:
+                    for sent in ("negative", "positive", "neutral"):
+                        pct = art_sbf_w[ft_type].get(sent, 0) / art_sbf_total[ft_type] * 100
+                        sbf_article_pcts[ft_type][sent].append(pct)
+
+    months = sorted(monthly_s.keys())
+    monthly = []
+    for month in months:
+        sd = monthly_s[month]
+        total = sum(sd.values())
+        if total < 1:
+            continue
+        fd = monthly_f[month]
+        ft = sum(fd.values())
+        ap = article_pcts.get(month, [])
+        monthly.append({
+            "month": month,
+            "pct_neg": round(sd.get("negative", 0) / total * 100, 1),
+            "pct_pos": round(sd.get("positive", 0) / total * 100, 1),
+            "pct_neu": round(sd.get("neutral", 0) / total * 100, 1),
+            "total": round(total, 1),
+            "pct_tool": round(fd.get("tool", 0) / ft * 100, 1) if ft else 0,
+            "pct_entity": round(fd.get("entity", 0) / ft * 100, 1) if ft else 0,
+            "neg_p25": _percentile([a["neg"] for a in ap], 25) if ap else None,
+            "neg_p75": _percentile([a["neg"] for a in ap], 75) if ap else None,
+            "pos_p25": _percentile([a["pos"] for a in ap], 25) if ap else None,
+            "pos_p75": _percentile([a["pos"] for a in ap], 75) if ap else None,
+            "tool_p25": _percentile([a["tool"] for a in ap if "tool" in a], 25) if any("tool" in a for a in ap) else None,
+            "tool_p75": _percentile([a["tool"] for a in ap if "tool" in a], 75) if any("tool" in a for a in ap) else None,
+            "entity_p25": _percentile([a["entity"] for a in ap if "entity" in a], 25) if any("entity" in a for a in ap) else None,
+            "entity_p75": _percentile([a["entity"] for a in ap if "entity" in a], 75) if any("entity" in a for a in ap) else None,
+            "n_articles": len(ap),
+        })
+
+    all_s = defaultdict(float)
+    all_f = defaultdict(float)
+    for d in monthly_s.values():
+        for k, v in d.items():
+            all_s[k] += v
+    for d in monthly_f.values():
+        for k, v in d.items():
+            all_f[k] += v
+
+    total_all = sum(all_s.values())
+    ft_all = sum(all_f.values())
+
+    random.seed(43)  # different seed so weighted examples differ from raw
+    sampled = {}
+    for key, items in examples.items():
+        pool = sorted(items, key=lambda x: x["weight"], reverse=True)[:60]
+        sampled[key] = random.sample(pool, min(4, len(pool)))
+
+    sbf_pct = {}
+    for framing, d in sbf.items():
+        ft = sum(d.values())
+        sbf_pct[framing] = {s: round(v / ft * 100, 1) for s, v in d.items()}
+
+    sbf_bands = {}
+    for framing, sents in sbf_article_pcts.items():
+        sbf_bands[framing] = {}
+        for sent, vals in sents.items():
+            sbf_bands[framing][sent] = {
+                "p25": _percentile(vals, 25),
+                "p75": _percentile(vals, 75),
+            }
+
+    return {
+        "monthly": monthly,
+        "overall": {k: round(v / total_all * 100, 1) for k, v in all_s.items()} if total_all else {},
+        "framing_overall": {k: round(v / ft_all * 100, 1) for k, v in all_f.items()} if ft_all else {},
+        "sbf": sbf_pct,
+        "sbf_bands": sbf_bands,
+        "total": total_unweighted,
         "examples": sampled,
     }
 
@@ -174,6 +407,7 @@ INDEX_HTML = """\
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>NYT AI Comments</title>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-annotation@3.0.1/dist/chartjs-plugin-annotation.min.js"></script>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #f5f5f5; color: #222; height: 100vh; display: flex; flex-direction: column; }
@@ -185,7 +419,7 @@ INDEX_HTML = """\
   .tab-btn.active { color: #2196F3; border-bottom-color: #2196F3; }
   .tab-content { display: none; flex: 1; overflow: hidden; }
   .tab-content.active { display: flex; }
-  #tab-insights.active { display: block; overflow-y: auto; }
+  #tab-insights.active, #tab-methods.active { display: block; overflow-y: auto; }
 
   /* ── BROWSER TAB ── */
   .loading { display: flex; align-items: center; justify-content: center; width: 100%; font-size: 18px; color: #999; }
@@ -264,6 +498,13 @@ INDEX_HTML = """\
   .quote-meta { font-size: 11px; color: #999; }
   .quote-meta strong { color: #666; font-style: normal; }
   .quote-article { font-size: 11px; color: #bbb; margin-top: 3px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .view-toggle { display: flex; align-items: center; gap: 8px; margin-bottom: 32px; }
+  .toggle-btn { padding: 8px 16px; border: 1px solid #ddd; border-radius: 20px; background: #fff; cursor: pointer; font-size: 13px; font-weight: 500; color: #555; }
+  .toggle-btn:hover { border-color: #999; }
+  .toggle-btn.active { background: #333; color: #fff; border-color: #333; }
+  .toggle-hint { font-size: 12px; color: #999; margin-left: 8px; }
+  .annotation-toggle { display: flex; align-items: center; gap: 6px; margin-bottom: 16px; font-size: 13px; color: #666; cursor: pointer; user-select: none; }
+  .annotation-toggle input { cursor: pointer; }
 </style>
 </head>
 <body>
@@ -271,6 +512,7 @@ INDEX_HTML = """\
 <nav class="tabs-nav">
   <button class="tab-btn active" id="btn-browser" onclick="showTab('browser')">Comment Browser</button>
   <button class="tab-btn" id="btn-insights" onclick="showTab('insights')">Insights</button>
+  <button class="tab-btn" id="btn-methods" onclick="showTab('methods')">Methodology</button>
 </nav>
 
 <!-- ── TAB 1: BROWSER ── -->
@@ -310,29 +552,17 @@ INDEX_HTML = """\
 <div id="tab-insights" class="tab-content">
   <div class="insights-page">
     <h1>How NYT Readers Feel About AI</h1>
-    <p class="insights-subtitle">
-      Analysis of <strong>__TOTAL__</strong> classified comments across <strong>__ARTICLE_COUNT__</strong> articles
-      &middot; November 2022 &ndash; March 2026
-    </p>
+    <p class="insights-subtitle" id="insightsSubtitle"></p>
 
-    <div class="key-stats">
-      <div class="key-stat">
-        <div class="ks-value" style="color:#e74c3c">__PCT_NEG__%</div>
-        <div class="ks-label">of comments are negative toward AI</div>
-      </div>
-      <div class="key-stat">
-        <div class="ks-value" style="color:#2ecc71">__PCT_POS__%</div>
-        <div class="ks-label">are positive toward AI</div>
-      </div>
-      <div class="key-stat">
-        <div class="ks-value" style="color:#3498db">__PCT_TOOL__%</div>
-        <div class="ks-label">frame AI as a tool</div>
-      </div>
-      <div class="key-stat">
-        <div class="ks-value" style="color:#9b59b6">__PCT_ENTITY__%</div>
-        <div class="ks-label">frame AI as an autonomous entity</div>
-      </div>
+    <div class="view-toggle">
+      <button class="toggle-btn active" onclick="switchView('raw', this)">Raw count</button>
+      <button class="toggle-btn" onclick="switchView('weighted', this)">Community-endorsed</button>
+      <span class="toggle-hint" id="toggleHint">Each comment counts equally</span>
     </div>
+
+    <div class="key-stats" id="keyStats"></div>
+
+    <label class="annotation-toggle"><input type="checkbox" id="annotationsToggle" onchange="toggleAnnotations(this.checked)"> Show key AI events on charts</label>
 
     <!-- Story 1: Mostly negative, consistently -->
     <div class="story-section">
@@ -342,7 +572,7 @@ INDEX_HTML = """\
         Despite major capability advances &mdash; GPT-4, Sora, DeepSeek &mdash; the ratio has remained remarkably
         stable: roughly half of commenters express fear, concern, or criticism of AI.
       </p>
-      <div class="chart-wrap"><canvas id="chartSentiment" height="75"></canvas></div>
+      <div class="chart-wrap"><canvas id="chartSentiment" height="110"></canvas></div>
       <p class="quotes-label">Representative negative comments</p>
       <div class="quotes-grid" id="quotes-negative"></div>
     </div>
@@ -355,7 +585,7 @@ INDEX_HTML = """\
         rather than as an entity with its own agency or will. This framing has also held steady over time,
         suggesting a stable conceptual model of AI in the public mind.
       </p>
-      <div class="chart-wrap"><canvas id="chartFraming" height="75"></canvas></div>
+      <div class="chart-wrap"><canvas id="chartFraming" height="110"></canvas></div>
       <p class="quotes-label">Comments framing AI as a tool</p>
       <div class="quotes-grid" id="quotes-tool"></div>
     </div>
@@ -387,6 +617,80 @@ INDEX_HTML = """\
   </div>
 </div>
 
+<!-- ── TAB 3: METHODOLOGY ── -->
+<div id="tab-methods" class="tab-content">
+  <div class="insights-page" style="max-width:760px">
+    <h1>Methodology</h1>
+
+    <div class="story-section">
+      <h2>Data collection</h2>
+      <p class="story-desc">
+        <strong>Articles:</strong> Extracted from the NYT Archive API (Nov 2022 &ndash; Mar 2026).
+        Headlines filtered for mentions of &ldquo;AI,&rdquo; &ldquo;A.I.,&rdquo; or &ldquo;artificial intelligence&rdquo;
+        using regex pattern matching. <strong>1,434 articles</strong> matched.<br><br>
+        <strong>Comments:</strong> All reader comments scraped via the NYT Community API, including replies.
+        Comments sorted by &ldquo;recommended&rdquo; (default NYT ordering).
+        <strong>138,450 comments</strong> collected.
+      </p>
+    </div>
+
+    <div class="story-section">
+      <h2>Sentiment &amp; framing classification</h2>
+      <p class="story-desc">
+        Each comment was classified by <strong>Google Gemini 3 Flash</strong> (via OpenRouter, temperature&nbsp;0.0)
+        on two dimensions:<br><br>
+        <strong>Sentiment</strong> &mdash; the commenter&rsquo;s attitude toward AI itself (not the article):<br>
+        &bull; <em>Positive:</em> enthusiasm, optimism, support<br>
+        &bull; <em>Negative:</em> fear, concern, criticism, opposition<br>
+        &bull; <em>Neutral:</em> factual discussion, genuine questions<br>
+        &bull; <em>Irrelevant:</em> not about AI<br><br>
+        <strong>Framing</strong> &mdash; how the commenter conceptualizes AI:<br>
+        &bull; <em>Tool:</em> AI as technology humans use and control<br>
+        &bull; <em>Entity:</em> AI as an autonomous agent with its own will or agency<br>
+        &bull; <em>Neither:</em> doesn&rsquo;t clearly fit either category<br><br>
+        Comments were truncated to 500 characters and processed in batches of 50.
+        Each classification includes a confidence level (high/medium/low).
+      </p>
+    </div>
+
+    <div class="story-section">
+      <h2>Community-endorsed (weighted) analysis</h2>
+      <p class="story-desc">
+        The weighted view adjusts for two biases in raw comment counts:<br><br>
+        <strong>1. Not all comments are equal.</strong> Likes (recommendations) indicate community endorsement.
+        We use <code>log(1 + likes)</code> to weight each comment, compressing the influence of viral outliers
+        while still reflecting community preference.<br><br>
+        <strong>2. Early comments get more likes.</strong> The first comments on an article accumulate
+        disproportionately more likes simply due to visibility. We correct for this by dividing each
+        comment&rsquo;s weight by <code>1 + 2.0 &times; position_rank</code>, where position_rank
+        ranges from 0.0 (first comment) to 1.0 (last). This applies at most a 3&times; correction.<br><br>
+        Replies (depth&nbsp;&gt;&nbsp;1) and comments with zero likes are excluded from the weighted view.
+      </p>
+    </div>
+
+    <div class="story-section">
+      <h2>Error bands</h2>
+      <p class="story-desc">
+        The shaded bands on the sentiment chart show the <strong>25th&ndash;75th percentile range</strong>
+        of per-article sentiment percentages within each month. Only articles with &ge;&nbsp;5 classified
+        comments are included. Wider bands indicate more variation between articles in that month;
+        narrow bands mean articles that month had similar sentiment distributions.
+      </p>
+    </div>
+
+    <div class="story-section">
+      <h2>Limitations</h2>
+      <p class="story-desc">
+        &bull; Single news source (NYT) with a specific readership demographic<br>
+        &bull; LLM-based classification may introduce systematic biases vs. human annotators<br>
+        &bull; Comment populations skew toward engaged, opinionated readers<br>
+        &bull; Like counts reflect NYT readership preferences, not the general public<br>
+        &bull; Early months (Nov&ndash;Dec 2022) have fewer articles, increasing variance
+      </p>
+    </div>
+  </div>
+</div>
+
 <script>
 // ── TAB SWITCHING ────────────────────────────────────────────────────────────
 let insightsInitialized = false;
@@ -395,7 +699,7 @@ function showTab(name) {
   document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
   document.getElementById('tab-' + name).classList.add('active');
   document.getElementById('btn-' + name).classList.add('active');
-  if (name === 'insights' && !insightsInitialized) { initInsights(); insightsInitialized = true; }
+  if (name === 'insights' && !insightsInitialized) { initInsights(insightsData); insightsInitialized = true; }
 }
 
 // ── BROWSER TAB ──────────────────────────────────────────────────────────────
@@ -514,70 +818,240 @@ function escHtml(s) {
 
 // ── INSIGHTS TAB ─────────────────────────────────────────────────────────────
 const insightsData = __INSIGHTS_DATA__;
+const insightsDataWeighted = __INSIGHTS_DATA_WEIGHTED__;
+let insightCharts = [];
+let currentView = 'raw';
+let showAnnotations = false;
+const articleCount = __ARTICLE_COUNT_NUM__;
 
-function initInsights() {
-  const d = insightsData;
+const AI_EVENTS = [
+  { month: '2022-11', label: 'ChatGPT launches', pos: 'start' },
+  { month: '2023-05', label: 'Senate hearings / Hinton / AI pause letter', pos: 'end' },
+  { month: '2023-12', label: 'Altman fired+rehired / Gemini', pos: 'start' },
+  { month: '2024-05', label: 'GPT-4o / Google I/O', pos: 'end' },
+  { month: '2025-01', label: 'DeepSeek R1', pos: 'start' },
+  { month: '2025-07', label: 'GPT-5 / Chatbot spirals', pos: 'end' },
+  { month: '2025-11', label: 'AI agents / regulation peak', pos: 'start' },
+];
+
+function buildAnnotations(months) {
+  const annots = {};
+  AI_EVENTS.forEach((ev, i) => {
+    const idx = months.indexOf(ev.month);
+    if (idx === -1) return;
+    annots['event' + i] = {
+      type: 'line',
+      xMin: idx, xMax: idx,
+      borderColor: 'rgba(0,0,0,0.2)',
+      borderWidth: 1,
+      borderDash: [4, 3],
+      display: showAnnotations,
+      label: {
+        display: showAnnotations,
+        content: ev.label,
+        position: ev.pos,
+        backgroundColor: 'rgba(255,255,255,0.92)',
+        color: '#555',
+        font: { size: 10, weight: '500' },
+        borderColor: '#ccc',
+        borderWidth: 1,
+        borderRadius: 3,
+        padding: { x: 6, y: 3 },
+      }
+    };
+  });
+  return annots;
+}
+
+function toggleAnnotations(on) {
+  showAnnotations = on;
+  // Update existing time-series charts (first two in the array)
+  insightCharts.slice(0, 2).forEach(chart => {
+    const annots = chart.options.plugins.annotation.annotations;
+    Object.values(annots).forEach(a => {
+      a.display = on;
+      if (a.label) a.label.display = on;
+    });
+    chart.update();
+  });
+}
+
+function initInsights(d) {
+  if (!d) d = insightsData;
+
+  // Destroy previous charts
+  insightCharts.forEach(c => c.destroy());
+  insightCharts = [];
+
+  // Update subtitle
+  const sub = document.getElementById('insightsSubtitle');
+  if (currentView === 'weighted') {
+    sub.innerHTML = 'Analysis of <strong>' + d.total.toLocaleString() + '</strong> top-level comments with likes, weighted by community endorsement &middot; November 2022 &ndash; March 2026';
+  } else {
+    sub.innerHTML = 'Analysis of <strong>' + d.total.toLocaleString() + '</strong> classified comments across <strong>' + articleCount.toLocaleString() + '</strong> articles &middot; November 2022 &ndash; March 2026';
+  }
+
+  // Update hint
+  document.getElementById('toggleHint').textContent =
+    currentView === 'weighted' ? 'Weighted by likes with position-bias correction, replies excluded' : 'Each comment counts equally';
+
+  // Update key stats
+  const o = d.overall;
+  const f = d.framing_overall || {};
+  document.getElementById('keyStats').innerHTML = `
+    <div class="key-stat"><div class="ks-value" style="color:#e74c3c">${o.negative || 0}%</div><div class="ks-label">of comments are negative toward AI</div></div>
+    <div class="key-stat"><div class="ks-value" style="color:#2ecc71">${o.positive || 0}%</div><div class="ks-label">are positive toward AI</div></div>
+    <div class="key-stat"><div class="ks-value" style="color:#3498db">${f.tool || 0}%</div><div class="ks-label">frame AI as a tool</div></div>
+    <div class="key-stat"><div class="ks-value" style="color:#9b59b6">${f.entity || 0}%</div><div class="ks-label">frame AI as an autonomous entity</div></div>`;
+
   const months = d.monthly.map(m => m.month);
   const chartDefaults = {
     responsive: true,
     plugins: { legend: { position: 'top' }, tooltip: { mode: 'index', intersect: false } },
   };
+  const yLabel = currentView === 'weighted' ? '% of weighted endorsement' : '% of classified comments';
 
-  // Chart 1: Sentiment over time
-  new Chart(document.getElementById('chartSentiment'), {
+  // Chart 1: Sentiment over time (with IQR bands)
+  const sentAnnotations = buildAnnotations(months);
+  insightCharts.push(new Chart(document.getElementById('chartSentiment'), {
     type: 'line',
     data: {
       labels: months,
       datasets: [
-        { label: 'Negative', data: d.monthly.map(m => m.pct_neg), borderColor: '#e74c3c', backgroundColor: 'rgba(231,76,60,0.07)', fill: true, tension: 0.35, pointRadius: 2 },
-        { label: 'Neutral',  data: d.monthly.map(m => m.pct_neu), borderColor: '#95a5a6', backgroundColor: 'rgba(149,165,166,0.07)', fill: true, tension: 0.35, pointRadius: 2 },
-        { label: 'Positive', data: d.monthly.map(m => m.pct_pos), borderColor: '#2ecc71', backgroundColor: 'rgba(46,204,113,0.07)', fill: true, tension: 0.35, pointRadius: 2 },
+        // Negative band (p75 upper bound)
+        { label: '_neg_hi', data: d.monthly.map(m => m.neg_p75), borderColor: 'transparent', backgroundColor: 'rgba(231,76,60,0.13)', fill: '+1', pointRadius: 0, tension: 0.35 },
+        // Negative band (p25 lower bound)
+        { label: '_neg_lo', data: d.monthly.map(m => m.neg_p25), borderColor: 'transparent', fill: false, pointRadius: 0, tension: 0.35 },
+        // Main negative line
+        { label: 'Negative', data: d.monthly.map(m => m.pct_neg), borderColor: '#e74c3c', backgroundColor: 'transparent', fill: false, tension: 0.35, pointRadius: 2, borderWidth: 2 },
+        // Neutral
+        { label: 'Neutral', data: d.monthly.map(m => m.pct_neu), borderColor: '#95a5a6', backgroundColor: 'transparent', fill: false, tension: 0.35, pointRadius: 2, borderWidth: 2 },
+        // Positive band (p75 upper bound)
+        { label: '_pos_hi', data: d.monthly.map(m => m.pos_p75), borderColor: 'transparent', backgroundColor: 'rgba(46,204,113,0.13)', fill: '+1', pointRadius: 0, tension: 0.35 },
+        // Positive band (p25 lower bound)
+        { label: '_pos_lo', data: d.monthly.map(m => m.pos_p25), borderColor: 'transparent', fill: false, pointRadius: 0, tension: 0.35 },
+        // Main positive line
+        { label: 'Positive', data: d.monthly.map(m => m.pct_pos), borderColor: '#2ecc71', backgroundColor: 'transparent', fill: false, tension: 0.35, pointRadius: 2, borderWidth: 2 },
       ]
     },
-    options: { ...chartDefaults, scales: {
-      y: { min: 0, max: 100, ticks: { callback: v => v + '%' }, title: { display: true, text: '% of classified comments' } },
-      x: { ticks: { maxTicksLimit: 14 } }
+    options: { ...chartDefaults,
+      plugins: {
+        ...chartDefaults.plugins,
+        annotation: { annotations: sentAnnotations },
+        legend: { position: 'top', labels: { filter: item => !item.text.startsWith('_') } },
+      },
+      scales: {
+        y: { min: 0, max: 100, ticks: { callback: v => v + '%' }, title: { display: true, text: yLabel } },
+        x: { ticks: { maxTicksLimit: 14 } }
     }}
-  });
+  }));
 
-  // Chart 2: Framing over time
-  new Chart(document.getElementById('chartFraming'), {
+  // Chart 2: Framing over time (with IQR bands)
+  const framAnnotations = buildAnnotations(months);
+  insightCharts.push(new Chart(document.getElementById('chartFraming'), {
     type: 'line',
     data: {
       labels: months,
       datasets: [
-        { label: 'Tool',   data: d.monthly.map(m => m.pct_tool),   borderColor: '#3498db', backgroundColor: 'rgba(52,152,219,0.09)', fill: true, tension: 0.35, pointRadius: 2 },
-        { label: 'Entity', data: d.monthly.map(m => m.pct_entity), borderColor: '#9b59b6', backgroundColor: 'rgba(155,89,182,0.09)', fill: true, tension: 0.35, pointRadius: 2 },
+        // Tool band
+        { label: '_tool_hi', data: d.monthly.map(m => m.tool_p75), borderColor: 'transparent', backgroundColor: 'rgba(52,152,219,0.13)', fill: '+1', pointRadius: 0, tension: 0.35 },
+        { label: '_tool_lo', data: d.monthly.map(m => m.tool_p25), borderColor: 'transparent', fill: false, pointRadius: 0, tension: 0.35 },
+        // Main tool line
+        { label: 'Tool',   data: d.monthly.map(m => m.pct_tool),   borderColor: '#3498db', backgroundColor: 'transparent', fill: false, tension: 0.35, pointRadius: 2, borderWidth: 2 },
+        // Entity band
+        { label: '_ent_hi', data: d.monthly.map(m => m.entity_p75), borderColor: 'transparent', backgroundColor: 'rgba(155,89,182,0.13)', fill: '+1', pointRadius: 0, tension: 0.35 },
+        { label: '_ent_lo', data: d.monthly.map(m => m.entity_p25), borderColor: 'transparent', fill: false, pointRadius: 0, tension: 0.35 },
+        // Main entity line
+        { label: 'Entity', data: d.monthly.map(m => m.pct_entity), borderColor: '#9b59b6', backgroundColor: 'transparent', fill: false, tension: 0.35, pointRadius: 2, borderWidth: 2 },
       ]
     },
-    options: { ...chartDefaults, scales: {
-      y: { min: 0, max: 100, ticks: { callback: v => v + '%' }, title: { display: true, text: '% of tool+entity framed comments' } },
-      x: { ticks: { maxTicksLimit: 14 } }
+    options: { ...chartDefaults,
+      plugins: {
+        ...chartDefaults.plugins,
+        annotation: { annotations: framAnnotations },
+        legend: { position: 'top', labels: { filter: item => !item.text.startsWith('_') } },
+      },
+      scales: {
+        y: { min: 0, max: 100, ticks: { callback: v => v + '%' }, title: { display: true, text: '% of tool+entity framed comments' } },
+        x: { ticks: { maxTicksLimit: 14 } }
     }}
-  });
+  }));
 
-  // Chart 3: Sentiment by framing (grouped bar)
-  const sentKeys = ['negative', 'neutral', 'positive', 'irrelevant'];
+  // Chart 3: Sentiment distribution conditioned on framing (with IQR whiskers)
   const tool   = d.sbf.tool   || {};
   const entity = d.sbf.entity || {};
-  new Chart(document.getElementById('chartSbf'), {
+  const tb = (d.sbf_bands || {}).tool || {};
+  const eb = (d.sbf_bands || {}).entity || {};
+
+  // Helper to get [p25, p75] for a framing+sentiment combo
+  const getBand = (bands, sent) => bands[sent] ? [bands[sent].p25, bands[sent].p75] : [null, null];
+
+  // Custom plugin to draw IQR whiskers on bars
+  const errorBarPlugin = {
+    id: 'errorBars',
+    afterDraw(chart) {
+      const ctx = chart.ctx;
+      chart.data.datasets.forEach((dataset, di) => {
+        if (!dataset.errorBars) return;
+        const meta = chart.getDatasetMeta(di);
+        dataset.errorBars.forEach((eb, i) => {
+          if (!eb || eb[0] == null) return;
+          const bar = meta.data[i];
+          if (!bar) return;
+          const x = bar.x;
+          const yLo = chart.scales.y.getPixelForValue(eb[0]);
+          const yHi = chart.scales.y.getPixelForValue(eb[1]);
+          const w = 6;
+          ctx.save();
+          ctx.strokeStyle = 'rgba(0,0,0,0.5)';
+          ctx.lineWidth = 1.5;
+          // Vertical line
+          ctx.beginPath(); ctx.moveTo(x, yLo); ctx.lineTo(x, yHi); ctx.stroke();
+          // Top cap
+          ctx.beginPath(); ctx.moveTo(x - w, yHi); ctx.lineTo(x + w, yHi); ctx.stroke();
+          // Bottom cap
+          ctx.beginPath(); ctx.moveTo(x - w, yLo); ctx.lineTo(x + w, yLo); ctx.stroke();
+          ctx.restore();
+        });
+      });
+    }
+  };
+
+  insightCharts.push(new Chart(document.getElementById('chartSbf'), {
     type: 'bar',
     data: {
-      labels: ['Negative', 'Neutral', 'Positive', 'Irrelevant'],
+      labels: ['Tool framing', 'Entity framing'],
       datasets: [
-        { label: 'Tool framing',   data: sentKeys.map(s => tool[s]   || 0), backgroundColor: '#3498db', borderRadius: 4 },
-        { label: 'Entity framing', data: sentKeys.map(s => entity[s] || 0), backgroundColor: '#9b59b6', borderRadius: 4 },
+        { label: 'Negative',   data: [tool.negative || 0, entity.negative || 0],   backgroundColor: '#e74c3c', borderRadius: 4,
+          errorBars: [getBand(tb, 'negative'), getBand(eb, 'negative')] },
+        { label: 'Neutral',    data: [tool.neutral || 0, entity.neutral || 0],     backgroundColor: '#95a5a6', borderRadius: 4,
+          errorBars: [getBand(tb, 'neutral'), getBand(eb, 'neutral')] },
+        { label: 'Positive',   data: [tool.positive || 0, entity.positive || 0],   backgroundColor: '#2ecc71', borderRadius: 4,
+          errorBars: [getBand(tb, 'positive'), getBand(eb, 'positive')] },
+        { label: 'Irrelevant', data: [tool.irrelevant || 0, entity.irrelevant || 0], backgroundColor: '#f39c12', borderRadius: 4 },
       ]
     },
     options: { ...chartDefaults, scales: {
-      y: { min: 0, max: 100, ticks: { callback: v => v + '%' }, title: { display: true, text: '% within framing group' } }
-    }}
-  });
+      y: { min: 0, max: 100, ticks: { callback: v => v + '%' }, title: { display: true, text: '% of comments within framing group' } }
+    }},
+    plugins: [errorBarPlugin]
+  }));
 
   renderQuotes('quotes-negative', d.examples.negative       || [], 'negative');
   renderQuotes('quotes-tool',     d.examples.tool            || [], 'tool');
   renderQuotes('quotes-entity',   d.examples.entity_negative || [], 'entity');
   renderQuotes('quotes-positive', d.examples.positive        || [], 'positive');
+
+  // Preserve annotation checkbox state
+  document.getElementById('annotationsToggle').checked = showAnnotations;
+}
+
+function switchView(mode, btn) {
+  currentView = mode;
+  document.querySelectorAll('.toggle-btn').forEach(b => b.classList.remove('active'));
+  btn.classList.add('active');
+  const d = mode === 'weighted' ? insightsDataWeighted : insightsData;
+  initInsights(d);
 }
 
 function renderQuotes(containerId, quotes, type) {
@@ -601,25 +1075,21 @@ def main():
     articles, num_classified = load_data()
     data = build_data_json(articles)
     insights = build_insights_data(articles)
+    insights_weighted = build_insights_data_weighted(articles)
 
     # Write data.json
     data_path = DOCS_DIR / "data.json"
     with open(data_path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False)
 
-    # Inject insights data + stat placeholders into HTML
+    # Inject both datasets into HTML
     insights_json = json.dumps(insights, ensure_ascii=True).replace("</", "<\\/")
-    overall = insights["overall"]
-    framing = insights["framing_overall"]
+    insights_w_json = json.dumps(insights_weighted, ensure_ascii=True).replace("</", "<\\/")
 
     html = INDEX_HTML
+    html = html.replace("__INSIGHTS_DATA_WEIGHTED__", insights_w_json)
     html = html.replace("__INSIGHTS_DATA__", insights_json)
-    html = html.replace("__TOTAL__", f"{insights['total']:,}")
-    html = html.replace("__ARTICLE_COUNT__", f"{len(articles):,}")
-    html = html.replace("__PCT_NEG__", str(overall.get("negative", 0)))
-    html = html.replace("__PCT_POS__", str(overall.get("positive", 0)))
-    html = html.replace("__PCT_TOOL__", str(framing.get("tool", 0)))
-    html = html.replace("__PCT_ENTITY__", str(framing.get("entity", 0)))
+    html = html.replace("__ARTICLE_COUNT_NUM__", str(len(articles)))
 
     html_path = DOCS_DIR / "index.html"
     with open(html_path, "w", encoding="utf-8") as f:
