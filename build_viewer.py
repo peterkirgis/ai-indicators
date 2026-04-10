@@ -17,6 +17,8 @@ import random
 from collections import defaultdict
 from pathlib import Path
 
+from geo import normalize_location, STATE_FIPS, STATE_FULL_NAMES, BACHELORS_PCT, GDP_PER_CAPITA
+
 WEIGHT_ALPHA = 2.0  # position bias correction: 1.0 = no correction, higher = more aggressive
 MIN_COMMENTS_FOR_BAND = 5  # articles need this many classified comments to contribute to error bands
 
@@ -221,6 +223,57 @@ def build_insights_data(articles):
                 "p75": _percentile(vals, 75),
             }
 
+    # Geographic breakdown by US state
+    geo_data = defaultdict(lambda: {"n": 0, "neg": 0, "pos": 0, "tool": 0, "entity": 0, "framed": 0})
+    geo_total = 0
+    geo_mapped = 0
+    geo_non_us = 0
+    for article in articles:
+        for comment in article["comments"]:
+            if not comment.get("sentiment"):
+                continue
+            loc = (comment.get("userLocation") or "").strip()
+            if not loc:
+                continue
+            geo_total += 1
+            state = normalize_location(loc)
+            if state is None:
+                continue
+            if state == "non-us":
+                geo_non_us += 1
+                continue
+            geo_mapped += 1
+            g = geo_data[state]
+            g["n"] += 1
+            if comment["sentiment"] == "negative":
+                g["neg"] += 1
+            elif comment["sentiment"] == "positive":
+                g["pos"] += 1
+            f = comment.get("framing", "")
+            if f == "tool":
+                g["tool"] += 1
+                g["framed"] += 1
+            elif f == "entity":
+                g["entity"] += 1
+                g["framed"] += 1
+
+    MIN_STATE_N = 50
+    geo_states = []
+    for state, g in sorted(geo_data.items(), key=lambda x: -x[1]["n"]):
+        if g["n"] < MIN_STATE_N:
+            continue
+        geo_states.append({
+            "state": state,
+            "name": STATE_FULL_NAMES.get(state, state),
+            "fips": STATE_FIPS.get(state, ""),
+            "n": g["n"],
+            "pct_neg": round(g["neg"] / g["n"] * 100, 1),
+            "pct_pos": round(g["pos"] / g["n"] * 100, 1),
+            "pct_entity": round(g["entity"] / g["framed"] * 100, 1) if g["framed"] >= 10 else None,
+            "bachelors_pct": BACHELORS_PCT.get(state),
+            "gdp_pc": GDP_PER_CAPITA.get(state),
+        })
+
     return {
         "monthly": monthly,
         "overall": {k: round(v / total_all * 100, 1) for k, v in all_s.items()},
@@ -229,6 +282,13 @@ def build_insights_data(articles):
         "sbf_bands": sbf_bands,
         "total": total_all,
         "examples": sampled,
+        "geo": {
+            "states": geo_states,
+            "mapped": geo_mapped,
+            "non_us": geo_non_us,
+            "total": geo_total,
+            "coverage_pct": round(geo_mapped / geo_total * 100, 1) if geo_total else 0,
+        },
     }
 
 
@@ -388,6 +448,66 @@ def build_insights_data_weighted(articles, alpha=WEIGHT_ALPHA):
                 "p75": _percentile(vals, 75),
             }
 
+    # Geographic breakdown (weighted)
+    geo_data = defaultdict(lambda: {"w": 0.0, "neg": 0.0, "pos": 0.0, "tool": 0.0, "entity": 0.0, "framed": 0.0, "n": 0})
+    geo_total = 0
+    geo_mapped = 0
+    geo_non_us = 0
+    for article in articles:
+        top_level = [c for c in article["comments"] if c.get("depth", 1) == 1 and c.get("sentiment")]
+        top_level.sort(key=lambda c: int(c.get("createDate") or 0))
+        n = len(top_level)
+        if not n:
+            continue
+        for i, comment in enumerate(top_level):
+            loc = (comment.get("userLocation") or "").strip()
+            if not loc:
+                continue
+            recs = comment.get("recommendations", 0)
+            frac_rank = i / (n - 1) if n > 1 else 0.0
+            w = math.log1p(recs) / (1 + alpha * frac_rank)
+            if w == 0:
+                continue
+            geo_total += 1
+            state = normalize_location(loc)
+            if state is None:
+                continue
+            if state == "non-us":
+                geo_non_us += 1
+                continue
+            geo_mapped += 1
+            g = geo_data[state]
+            g["w"] += w
+            g["n"] += 1
+            if comment["sentiment"] == "negative":
+                g["neg"] += w
+            elif comment["sentiment"] == "positive":
+                g["pos"] += w
+            f = comment.get("framing", "")
+            if f == "tool":
+                g["tool"] += w
+                g["framed"] += w
+            elif f == "entity":
+                g["entity"] += w
+                g["framed"] += w
+
+    MIN_STATE_N = 50
+    geo_states = []
+    for state, g in sorted(geo_data.items(), key=lambda x: -x[1]["n"]):
+        if g["n"] < MIN_STATE_N:
+            continue
+        geo_states.append({
+            "state": state,
+            "name": STATE_FULL_NAMES.get(state, state),
+            "fips": STATE_FIPS.get(state, ""),
+            "n": g["n"],
+            "pct_neg": round(g["neg"] / g["w"] * 100, 1) if g["w"] else 0,
+            "pct_pos": round(g["pos"] / g["w"] * 100, 1) if g["w"] else 0,
+            "pct_entity": round(g["entity"] / g["framed"] * 100, 1) if g["framed"] >= 10 else None,
+            "bachelors_pct": BACHELORS_PCT.get(state),
+            "gdp_pc": GDP_PER_CAPITA.get(state),
+        })
+
     return {
         "monthly": monthly,
         "overall": {k: round(v / total_all * 100, 1) for k, v in all_s.items()} if total_all else {},
@@ -396,6 +516,13 @@ def build_insights_data_weighted(articles, alpha=WEIGHT_ALPHA):
         "sbf_bands": sbf_bands,
         "total": total_unweighted,
         "examples": sampled,
+        "geo": {
+            "states": geo_states,
+            "mapped": geo_mapped,
+            "non_us": geo_non_us,
+            "total": geo_total,
+            "coverage_pct": round(geo_mapped / geo_total * 100, 1) if geo_total else 0,
+        },
     }
 
 
@@ -408,6 +535,8 @@ INDEX_HTML = """\
 <title>NYT AI Comments</title>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-annotation@3.0.1/dist/chartjs-plugin-annotation.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chartjs-chart-geo@4.1.1"></script>
+<script src="https://cdn.jsdelivr.net/npm/topojson-client@3"></script>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #f5f5f5; color: #222; height: 100vh; display: flex; flex-direction: column; }
@@ -510,13 +639,13 @@ INDEX_HTML = """\
 <body>
 
 <nav class="tabs-nav">
-  <button class="tab-btn active" id="btn-browser" onclick="showTab('browser')">Comment Browser</button>
-  <button class="tab-btn" id="btn-insights" onclick="showTab('insights')">Insights</button>
+  <button class="tab-btn active" id="btn-insights" onclick="showTab('insights')">Insights</button>
+  <button class="tab-btn" id="btn-browser" onclick="showTab('browser')">Comment Browser</button>
   <button class="tab-btn" id="btn-methods" onclick="showTab('methods')">Methodology</button>
 </nav>
 
 <!-- ── TAB 1: BROWSER ── -->
-<div id="tab-browser" class="tab-content active">
+<div id="tab-browser" class="tab-content">
   <div class="loading" id="loading">Loading data&hellip;</div>
   <div class="layout" id="app" style="display:none">
     <div class="sidebar">
@@ -549,7 +678,7 @@ INDEX_HTML = """\
 </div>
 
 <!-- ── TAB 2: INSIGHTS ── -->
-<div id="tab-insights" class="tab-content">
+<div id="tab-insights" class="tab-content active">
   <div class="insights-page">
     <h1>How NYT Readers Feel About AI</h1>
     <p class="insights-subtitle" id="insightsSubtitle"></p>
@@ -613,6 +742,28 @@ INDEX_HTML = """\
         and creative possibilities.
       </p>
       <div class="quotes-grid" id="quotes-positive"></div>
+    </div>
+
+    <!-- Story 5: Geography -->
+    <div class="story-section">
+      <h2>Does where you live shape how you feel about AI?</h2>
+      <p class="story-desc" id="geoDesc"></p>
+      <div class="filter-row" style="margin-bottom:16px">
+        <button class="filter-btn active" id="geoBtn-sentiment" onclick="switchGeoView('sentiment', this)" style="border-left: 4px solid #2ecc71">Sentiment (% positive)</button>
+        <button class="filter-btn" id="geoBtn-framing" onclick="switchGeoView('framing', this)" style="border-left: 4px solid #9b59b6">Mental model (% entity)</button>
+      </div>
+      <div class="chart-wrap" style="position:relative; height:520px; margin-bottom:0;"><canvas id="chartGeo"></canvas></div>
+      <div id="geoLegend" style="display:flex; align-items:center; justify-content:center; gap:8px; font-size:12px; color:#888; margin:8px 0 16px;"></div>
+      <div style="display:flex; gap:16px; flex-wrap:wrap;">
+        <div style="flex:1; min-width:380px;">
+          <div class="chart-wrap"><canvas id="chartGeoPolitics" height="280"></canvas></div>
+          <p class="story-desc" id="corrPolitics" style="margin-top:8px; text-align:center; font-size:13px;"></p>
+        </div>
+        <div style="flex:1; min-width:380px;">
+          <div class="chart-wrap"><canvas id="chartGeoGdp" height="280"></canvas></div>
+          <p class="story-desc" id="corrGdp" style="margin-top:8px; text-align:center; font-size:13px;"></p>
+        </div>
+      </div>
     </div>
   </div>
 </div>
@@ -679,6 +830,20 @@ INDEX_HTML = """\
     </div>
 
     <div class="story-section">
+      <h2>Geographic analysis &amp; reference data</h2>
+      <p class="story-desc">
+        Commenter locations are self-reported free text, normalized to US states using pattern matching
+        (state names, abbreviations, &ldquo;City, ST&rdquo; patterns, and a dictionary of ~100 major US cities).
+        Coverage: ~65% of comments mapped to a US state. States with fewer than 50 classified comments are excluded.<br><br>
+        <strong>Education:</strong> Percentage of adults 25+ with a bachelor&rsquo;s degree or higher, from the
+        US Census Bureau American Community Survey 2023 1-year estimates (Table S1501).
+        DC is excluded from the scatter plot as an outlier (62.5%).<br>
+        <strong>GDP per capita:</strong> Bureau of Economic Analysis (BEA), 2023 state-level GDP per capita in current dollars.
+        DC is excluded from the GDP scatter plot as an outlier ($236K).
+      </p>
+    </div>
+
+    <div class="story-section">
       <h2>Limitations</h2>
       <p class="story-desc">
         &bull; Single news source (NYT) with a specific readership demographic<br>
@@ -699,7 +864,7 @@ function showTab(name) {
   document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
   document.getElementById('tab-' + name).classList.add('active');
   document.getElementById('btn-' + name).classList.add('active');
-  if (name === 'insights' && !insightsInitialized) { initInsights(insightsData); insightsInitialized = true; }
+  if (name === 'insights' && !insightsInitialized) { tryInitInsights(); }
 }
 
 // ── BROWSER TAB ──────────────────────────────────────────────────────────────
@@ -822,7 +987,306 @@ const insightsDataWeighted = __INSIGHTS_DATA_WEIGHTED__;
 let insightCharts = [];
 let currentView = 'raw';
 let showAnnotations = false;
+let currentGeoView = 'sentiment';
+let geoChart = null;
+let usTopoReady = false;
+let usTopoStates = null;
 const articleCount = __ARTICLE_COUNT_NUM__;
+
+function tryInitInsights() {
+  if (!insightsInitialized && usTopoReady) {
+    initInsights(insightsData);
+    insightsInitialized = true;
+  }
+}
+
+// Pre-fetch US topology, then init insights (since it's the default tab)
+fetch('https://cdn.jsdelivr.net/npm/us-atlas@3/states-10m.json')
+  .then(r => r.json())
+  .then(topo => {
+    usTopoStates = topojson.feature(topo, topo.objects.states).features;
+    usTopoReady = true;
+    tryInitInsights();
+  });
+
+function renderGeoMap(geoStates, mode) {
+  if (!usTopoReady || !usTopoStates) return;
+
+  // Build lookup by FIPS
+  const byFips = {};
+  geoStates.forEach(s => { if (s.fips) byFips[s.fips] = s; });
+
+  const isFraming = mode === 'framing';
+  const label = isFraming ? '% entity framing' : '% positive sentiment';
+
+  // Sentiment: red (low pos) -> green (high pos)
+  // Framing: blue (low entity/more tool) -> purple (high entity)
+  const colorLo = isFraming ? [52, 152, 219]  : [231, 76, 60];
+  const colorHi = isFraming ? [155, 89, 182]  : [46, 204, 113];
+
+  // Get value range for color scaling
+  const vals = geoStates.map(s => isFraming ? (s.pct_entity || 0) : s.pct_pos).filter(v => v != null);
+  const vMin = Math.min(...vals);
+  const vMax = Math.max(...vals);
+
+  const chartData = usTopoStates.map(feature => {
+    const fips = String(feature.id).padStart(2, '0');
+    const s = byFips[fips];
+    return {
+      feature: feature,
+      value: s ? (isFraming ? (s.pct_entity || 0) : s.pct_pos) : null,
+      stateData: s || null,
+    };
+  });
+
+  // Destroy previous geo chart
+  if (geoChart) { geoChart.destroy(); geoChart = null; }
+
+  const canvas = document.getElementById('chartGeo');
+  if (!canvas) return;
+
+  geoChart = new Chart(canvas, {
+    type: 'choropleth',
+    data: {
+      labels: chartData.map(d => d.feature.properties ? d.feature.properties.name : ''),
+      datasets: [{
+        label: label,
+        data: chartData,
+        backgroundColor: (ctx) => {
+          const v = ctx.raw && ctx.raw.value;
+          if (v == null) return '#e8e8e8';
+          const t = (v - vMin) / (vMax - vMin || 1);
+          const r = Math.round(colorLo[0] + t * (colorHi[0] - colorLo[0]));
+          const g = Math.round(colorLo[1] + t * (colorHi[1] - colorLo[1]));
+          const b = Math.round(colorLo[2] + t * (colorHi[2] - colorLo[2]));
+          return 'rgb(' + r + ',' + g + ',' + b + ')';
+        },
+        borderColor: '#fff',
+        borderWidth: 0.5,
+      }]
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      showOutline: true,
+      showGraticule: false,
+      plugins: {
+        legend: { display: false },
+        tooltip: {
+          callbacks: {
+            label: function(ctx) {
+              const d = ctx.raw;
+              if (!d || !d.stateData) return 'No data';
+              const s = d.stateData;
+              if (isFraming) {
+                return [
+                  s.name + ' (' + s.state + ')',
+                  'Entity framing: ' + (s.pct_entity != null ? s.pct_entity + '%' : 'n/a'),
+                  'n = ' + s.n.toLocaleString() + ' comments'
+                ];
+              }
+              return [
+                s.name + ' (' + s.state + ')',
+                'Positive: ' + s.pct_pos + '%',
+                'Negative: ' + s.pct_neg + '%',
+                'n = ' + s.n.toLocaleString() + ' comments'
+              ];
+            }
+          }
+        }
+      },
+      scales: {
+        projection: {
+          axis: 'x',
+          projection: 'albersUsa',
+        },
+        color: {
+          axis: 'x',
+          display: false,
+          legend: { display: false },
+        }
+      }
+    }
+  });
+
+  // Update color legend below map
+  const legendEl = document.getElementById('geoLegend');
+  if (legendEl) {
+    const loRgb = 'rgb(' + colorLo.join(',') + ')';
+    const hiRgb = 'rgb(' + colorHi.join(',') + ')';
+    const loLabel = isFraming ? 'Less entity' : 'Less positive';
+    const hiLabel = isFraming ? 'More entity' : 'More positive';
+    legendEl.innerHTML =
+      '<span>' + loLabel + '</span>' +
+      '<div style="width:180px;height:12px;border-radius:6px;background:linear-gradient(to right,' + loRgb + ',' + hiRgb + ')"></div>' +
+      '<span>' + hiLabel + '</span>' +
+      '<span style="margin-left:12px;color:#ccc">|</span>' +
+      '<span style="margin-left:12px"><span style="display:inline-block;width:12px;height:12px;border-radius:2px;background:#e8e8e8;vertical-align:middle"></span> No data</span>';
+  }
+}
+
+let geoScatterCharts = [];
+
+function linearRegression(points) {
+  const n = points.length;
+  if (n < 3) return { slope: 0, intercept: 0, r: 0 };
+  let sx = 0, sy = 0, sxx = 0, sxy = 0, syy = 0;
+  points.forEach(p => { sx += p.x; sy += p.y; sxx += p.x*p.x; sxy += p.x*p.y; syy += p.y*p.y; });
+  const denom = n * sxx - sx * sx;
+  const slope = (n * sxy - sx * sy) / denom;
+  const intercept = (sy - slope * sx) / n;
+  const mx = sx / n, my = sy / n;
+  let num = 0, dx2 = 0, dy2 = 0;
+  points.forEach(p => { const dx = p.x - mx, dy = p.y - my; num += dx*dy; dx2 += dx*dx; dy2 += dy*dy; });
+  const r = num / (Math.sqrt(dx2 * dy2) || 1);
+  return { slope, intercept, r };
+}
+
+function renderGeoScatters(geoStates, mode) {
+  geoScatterCharts.forEach(c => c.destroy());
+  geoScatterCharts = [];
+
+  const isFraming = mode === 'framing';
+  const yKey = isFraming ? 'pct_entity' : 'pct_pos';
+  const yLabel = isFraming ? '% entity framing' : '% positive toward AI';
+  const yColor = isFraming ? '#9b59b6' : '#2ecc71';
+  const trendColor = isFraming ? 'rgba(155,89,182,0.4)' : 'rgba(46,204,113,0.4)';
+
+  // Filter states with valid data
+  const withEdu = geoStates.filter(s => s.bachelors_pct != null && s[yKey] != null);
+  const withGdp = geoStates.filter(s => s.gdp_pc != null && s[yKey] != null);
+
+  // Scatter 1: Education
+  const eduCanvas = document.getElementById('chartGeoPolitics');
+  if (eduCanvas && withEdu.length) {
+    const eduPoints = withEdu.filter(s => s.state !== 'DC').map(s => ({ x: s.bachelors_pct, y: s[yKey] }));
+    const eduReg = linearRegression(eduPoints);
+    const eduXmin = Math.min(...eduPoints.map(p => p.x));
+    const eduXmax = Math.max(...eduPoints.map(p => p.x));
+
+    geoScatterCharts.push(new Chart(eduCanvas, {
+      type: 'scatter',
+      data: {
+        datasets: [
+          {
+            label: 'States',
+            data: withEdu.filter(s => s.state !== 'DC').map(s => ({ x: s.bachelors_pct, y: s[yKey], state: s.state, n: s.n })),
+            backgroundColor: yColor,
+            pointRadius: (ctx) => {
+              const n = ctx.raw && ctx.raw.n || 50;
+              return Math.max(3, Math.min(12, Math.sqrt(n / 30)));
+            },
+            pointHoverRadius: 8,
+          },
+          {
+            label: 'Trend',
+            data: [
+              { x: eduXmin, y: eduReg.intercept + eduReg.slope * eduXmin },
+              { x: eduXmax, y: eduReg.intercept + eduReg.slope * eduXmax },
+            ],
+            type: 'line',
+            borderColor: trendColor,
+            borderWidth: 2,
+            borderDash: [6, 3],
+            pointRadius: 0,
+            fill: false,
+          }
+        ]
+      },
+      options: {
+        responsive: true,
+        plugins: {
+          legend: { display: false },
+          tooltip: {
+            filter: ctx => ctx.datasetIndex === 0,
+            callbacks: {
+              label: ctx => ctx.raw.state + ': ' + yLabel.split('%')[0] + ctx.raw.y + '%, BA+ ' + ctx.raw.x + '% (n=' + ctx.raw.n.toLocaleString() + ')'
+            }
+          }
+        },
+        scales: {
+          x: { title: { display: true, text: "% adults with bachelor's degree or higher (ACS 2023)" } },
+          y: { title: { display: true, text: yLabel } }
+        }
+      }
+    }));
+
+    const corrEl = document.getElementById('corrPolitics');
+    if (corrEl) corrEl.innerHTML = '<strong>r = ' + eduReg.r.toFixed(3) + '</strong> &middot; r&sup2; = ' + (eduReg.r * eduReg.r).toFixed(3);
+  }
+
+  // Scatter 2: GDP
+  const gdpCanvas = document.getElementById('chartGeoGdp');
+  const gdpFiltered = withGdp.filter(s => s.state !== 'DC');
+  if (gdpCanvas && gdpFiltered.length) {
+    const gdpPoints = gdpFiltered.map(s => ({ x: Math.round(s.gdp_pc / 1000), y: s[yKey] }));
+    const gdpReg = linearRegression(gdpPoints);
+    const gdpXmin = Math.min(...gdpPoints.map(p => p.x));
+    const gdpXmax = Math.max(...gdpPoints.map(p => p.x));
+
+    geoScatterCharts.push(new Chart(gdpCanvas, {
+      type: 'scatter',
+      data: {
+        datasets: [
+          {
+            label: 'States',
+            data: gdpFiltered.map(s => ({ x: Math.round(s.gdp_pc / 1000), y: s[yKey], state: s.state, n: s.n })),
+            backgroundColor: yColor,
+            pointRadius: (ctx) => {
+              const n = ctx.raw && ctx.raw.n || 50;
+              return Math.max(3, Math.min(12, Math.sqrt(n / 30)));
+            },
+            pointHoverRadius: 8,
+          },
+          {
+            label: 'Trend',
+            data: [
+              { x: gdpXmin, y: gdpReg.intercept + gdpReg.slope * gdpXmin },
+              { x: gdpXmax, y: gdpReg.intercept + gdpReg.slope * gdpXmax },
+            ],
+            type: 'line',
+            borderColor: trendColor,
+            borderWidth: 2,
+            borderDash: [6, 3],
+            pointRadius: 0,
+            fill: false,
+          }
+        ]
+      },
+      options: {
+        responsive: true,
+        plugins: {
+          legend: { display: false },
+          tooltip: {
+            filter: ctx => ctx.datasetIndex === 0,
+            callbacks: {
+              label: ctx => ctx.raw.state + ': ' + yLabel.split('%')[0] + ctx.raw.y + '%, GDP $' + ctx.raw.x + 'K (n=' + ctx.raw.n.toLocaleString() + ')'
+            }
+          }
+        },
+        scales: {
+          x: { title: { display: true, text: 'GDP per capita ($K, 2023)' } },
+          y: { title: { display: true, text: yLabel } }
+        }
+      }
+    }));
+
+    const corrEl = document.getElementById('corrGdp');
+    if (corrEl) corrEl.innerHTML = '<strong>r = ' + gdpReg.r.toFixed(3) + '</strong> &middot; r&sup2; = ' + (gdpReg.r * gdpReg.r).toFixed(3);
+  }
+}
+
+function switchGeoView(mode, btn) {
+  currentGeoView = mode;
+  btn.parentElement.querySelectorAll('.filter-btn').forEach(b => b.classList.remove('active'));
+  btn.classList.add('active');
+  const d = currentView === 'weighted' ? insightsDataWeighted : insightsData;
+  const geoStates = (d.geo || {}).states || [];
+  if (geoStates.length) {
+    renderGeoMap(geoStates, mode);
+    renderGeoScatters(geoStates, mode);
+  }
+}
 
 const AI_EVENTS = [
   { month: '2022-11', label: 'ChatGPT launches', pos: 'start' },
@@ -1041,6 +1505,21 @@ function initInsights(d) {
   renderQuotes('quotes-tool',     d.examples.tool            || [], 'tool');
   renderQuotes('quotes-entity',   d.examples.entity_negative || [], 'entity');
   renderQuotes('quotes-positive', d.examples.positive        || [], 'positive');
+
+  // Chart 5: Geography (choropleth)
+  const geo = d.geo || {};
+  const geoStates = geo.states || [];
+  const geoDesc = document.getElementById('geoDesc');
+  if (geoStates.length && geoDesc) {
+    geoDesc.innerHTML = 'Sentiment toward AI by US state, based on commenter-reported locations. ' +
+      '<strong>' + (geo.coverage_pct || 0) + '%</strong> of comments mapped to a US state (' +
+      (geo.mapped || 0).toLocaleString() + ' comments). States with fewer than 50 comments excluded. ' +
+      'Hover over a state for details.';
+  }
+  if (geoStates.length && usTopoReady) {
+    renderGeoMap(geoStates, currentGeoView);
+    renderGeoScatters(geoStates, currentGeoView);
+  }
 
   // Preserve annotation checkbox state
   document.getElementById('annotationsToggle').checked = showAnnotations;
